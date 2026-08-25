@@ -42,6 +42,7 @@ Authorization: Bearer $NVIDIA_API_KEY
 - 输出分层设计（summary / raw / save），防止 MCP context 爆炸
 - 完整错误分类（400/401/403/404/408/413/422/429/5xx/timeout）+ retry/backoff
 - API Key 只从环境变量读取，绝不写死、绝不进日志
+- 配套批量脚本：`scripts/score_fasta.py`（批量 FASTA 评分 + **embedding 提取**，见 §18）与 `scripts/analyze_run.py`（聚类/分类/回归下游分析，见 §19）
 
 ## 2. Evo2 API 介绍
 
@@ -114,7 +115,7 @@ pixi install
 pixi run test
 ```
 
-要求 Python >= 3.10（推荐 3.11+）。依赖：`mcp>=1.2`、`httpx>=0.27`、`numpy>=1.26`、`pydantic>=2.6`、`python-dotenv>=1.0`。
+要求 Python >= 3.10（推荐 3.11+）。核心依赖：`mcp>=2.0`、`httpx>=0.27`、`numpy>=1.26`、`pydantic>=2.6`、`python-dotenv>=1.0`。分析脚本（`scripts/analyze_run.py`）额外需要 dev 依赖：`scikit-learn`、`pandas`、`matplotlib`。
 
 ## 5. 环境变量
 
@@ -363,6 +364,8 @@ Agent 想要完整 logits 时：
 
 （或 `"fasta_path": "/data/genomes/genes.fa"`，需配置 `EVO2_MCP_ALLOWED_DIRS=/data/genomes`）
 
+大批量 FASTA（如整目录的 enhancer/promoter）评分 + 提取 embedding，用 `scripts/score_fasta.py`（见 §18）—— 每次运行输出独立 run 文件夹（`scores.csv` + `embeddings.npz`）。
+
 ## 11. Variant scoring 示例
 
 ```json
@@ -450,11 +453,84 @@ without additional validation.
 - NVIDIA NIM for Evo 2 — Quickstart：<https://docs.nvidia.com/nim/bionemo/evo2/latest/quickstart-guide.html>
 - NVIDIA 托管 API 参考（arc/evo2-7b-forward OpenAPI schema）：<https://docs.api.nvidia.com/nim/reference/arc-evo2-7b-infer>
 - **托管端点实测（2026-08-24，真实 key）**：`output_layer` 返回 422 `StripedHyena has no attribute 'output_layer'`；`unembed` 返回 logits（NPZ key `unembed.output`，shape `(1, seq, 512)`，float64）—— 因此评分工具默认 `EVO2_MCP_LOGITS_LAYER=auto` 自动探测
+- **批量实测（2026-08-25，真实 key，3800+ 条 K562 enhancer/promoter）**：
+  - 序列 **> ~100 kb 时托管端返回 422**（PyTorch `canUse32BitIndexMath` 限制）—— 批量跑用 `--skip-longer-than 100000`；
+  - 并发下 layer 名自动探测的**竞态已修复**（`forward_logits` 用局部变量记录尝试名）并加了回归测试；
+  - embedding 提取：`norm`/`embedding_layer`/`blocks.N` 均可用，shape `(1, seq, 4096)` float64（mean-pool 后 4096 维）。
 - Arc Institute Evo2 仓库（`scoring.py`、`models.py`）：<https://github.com/ArcInstitute/evo2>
 - vortex `CharLevelTokenizer`（Evo2 官方 tokenizer 实现）：PyPI `vtx` 1.1.0 源码 `vortex/model/tokenizer.py`
 - Evo2 模型卡：<https://huggingface.co/ArcInstitute/evo2_7b>
 
 若 NVIDIA 调整 API，请以官方最新文档为准；`EVO2_MCP_BASE_URL` 可随时切换。
+
+## 18. 批量评分与 Embedding 提取（scripts/score_fasta.py）
+
+MCP Tools 适合 Agent 交互式调用；**大批量 FASTA 评分**用配套脚本 `scripts/score_fasta.py`（真实 API 已用 3800+ 条 K562 enhancer/promoter 验证）。
+
+**每次运行自动创建一个带时间戳的独立文件夹**：
+
+```text
+output/run_20260825_104403/
+├── scores.csv            # 每序列一行：id, header, length, total/mean LL, ...
+│                         #   + embedding_key（与 embeddings.npz 的 record_ids 对齐）
+└── embeddings.npz        # embeddings: (n, 4096) float32 mean-pooled 矩阵
+                          # record_ids: 与矩阵行一一对应的键（来源__序列id）
+```
+
+```bash
+# 小样本（指定 id）
+.pixi/envs/dev/bin/python scripts/score_fasta.py \
+  --fasta /path/cis/enhancers.fa /path/cis/promoters.fa \
+  --ids K562_TE_629,K562_MPT_6842 --allow-ambiguous
+
+# 全量（跳过 >100kb —— 托管端对该长度返回 422；保留原始 embedding）
+.pixi/envs/dev/bin/python scripts/score_fasta.py \
+  --fasta /path/cis/enhancers.fa /path/cis/promoters.fa \
+         /path/trans/enhancers.fa /path/trans/promoters.fa \
+  --skip-longer-than 100000 --allow-ambiguous \
+  --embedding-layer norm --keep-raw-embeddings
+```
+
+关键参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--embedding-layer norm\|blocks.31\|embedding_layer\|none` | 提取哪个 layer 的 embedding（默认 `norm`）；`none` 只评分 |
+| `--keep-raw-embeddings` | 额外保存每条**原始逐位** embedding `(1, seq, 4096)` 到 `embeddings_raw/`（**磁盘占用大**：10 kb 序列 ≈ 328 MB；默认不存） |
+| `--skip-longer-than 100000` | 跳过超过该长度的序列（托管 API 限制，见 §17） |
+| `--allow-ambiguous` | 允许 N 碱基透传（5 条含 N 的序列照常跑并带 caveat 警告） |
+| `--max-concurrency 2` | 并发数（默认 2，尊重 rate limit） |
+| `--out / --embeddings-out / --embedding-raw-dir` | 覆盖默认 run 文件夹布局 |
+
+**效率设计**：每条序列只发一次请求（`output_layers=["unembed","norm"]`，logits 与 embedding 同取）；logits layer 名整次运行只探测一次；相同并发由信号量限制。
+
+## 19. Embedding 关联与下游分析（scripts/analyze_run.py）
+
+`embeddings.npz` 是 mean-pooled 的序列表示（每序列一个 4096 维向量），适合直接做聚类、分类、回归。加载与关联：
+
+```python
+import csv, numpy as np
+
+run = "output/run_20260825_104403"
+rows = list(csv.DictReader(open(f"{run}/scores.csv")))
+d = np.load(f"{run}/embeddings.npz", allow_pickle=True)
+X = d["embeddings"]                        # (n, 4096) float32
+ids = [str(x) for x in d["record_ids"]]    # 与 X 行一一对应
+key_to_row = {r["embedding_key"]: r for r in rows if r.get("embedding_key")}
+scores = [key_to_row[k] for k in ids]      # scores[i] ↔ X[i]
+```
+
+一键跑完整分析（KMeans 聚类、enhancer-vs-promoter 分类、embedding→likelihood 回归、PCA 图）：
+
+```bash
+.pixi/envs/dev/bin/python scripts/analyze_run.py output/run_20260825_104403 --k 3
+```
+
+输出 `analysis_<run>.npz`（合并后的 `X` + `keys`）和 `analysis_<run>.png`。分析要点：
+
+- 4096 维向量做相似度/聚类前先**单位化**（脚本已做）；
+- 小样本时分类/回归自动跳过（保护阈值 ≥6 条）；全量 3806 条跑完后这些分析才有统计意义；
+- 键 `cis_enhancers__xxx` → 类别 enhancers、区域 cis；`trans_*` 同理（`parse_source` 可改标签维度做 cis-vs-trans 分类）。
 
 ## 开发与测试
 
@@ -463,13 +539,15 @@ pixi install          # 或 pip install -e ".[dev]"
 pixi run test         # 运行 pytest（全部 mock，不调用真实 API）
 ```
 
-测试覆盖：序列校验、大小写/空白归一化、非法字符、缺 API key、forward 请求构造、401/429/5xx/timeout、variant 校验、variant/batch 评分数学正确性、NPZ 解码、FASTA 沙箱等。
+离线测试 **91 passed / 4 skipped**（skip = live 门控）。覆盖：序列校验、大小写/空白归一化、非法字符、缺 API key、forward 请求构造、401/408/429/5xx/timeout、layer 名自动探测（含并发竞态回归）、variant 校验、variant/batch 评分数学正确性（对照 Arc 语义独立复算）、NPZ 解码（JSON base64 / zip / 旧版 JSON tensor / `<layer>.output` key）、FASTA 沙箱、MCP session 集成、脚本纯函数（pooling/键名）等。
 
-**真实 API 冒烟测试**（需要真实 key，默认跳过）：
+**真实 API 冒烟测试**（需要真实 key，默认跳过）。key 从 `.env` 自动读取（`Settings.from_env()` 已加载）：
 
 ```bash
-NVIDIA_API_KEY=nvapi-xxx EVO2_MCP_RUN_LIVE=1 pixi run python -m pytest tests/test_live_api.py -s
+EVO2_MCP_RUN_LIVE=1 .pixi/envs/dev/bin/python -m pytest tests/test_live_api.py -v -s
 ```
+
+live 测试会真实请求 NVIDIA 端点，验证：logits layer 自动探测（`unembed`）、真实 NPZ 解析（`(1, seq, 512)` float64）、`evo2_score` 与手工从原始 logits 复算一致、variant score。
 
 ## 项目结构
 
@@ -483,11 +561,14 @@ NVIDIA_API_KEY=nvapi-xxx EVO2_MCP_RUN_LIVE=1 pixi run python -m pytest tests/tes
 │   ├── __main__.py      # python -m evo2_mcp 入口
 │   ├── config.py        # 环境变量配置
 │   ├── sequence.py      # DNA 校验/归一化
-│   ├── api_client.py    # HTTP 客户端（retry/backoff/错误分类/响应解码）
-│   ├── forward_output.py# NPZ 解码 + likelihood 计算
+│   ├── api_client.py    # HTTP 客户端（retry/backoff/错误分类/响应解码 + layer 自动探测）
+│   ├── forward_output.py# NPZ 解码 + likelihood 计算 + embedding 提取
 │   ├── fasta.py         # FASTA 解析 + 读取沙箱
 │   ├── tools.py         # 5 个 Tool 的实现
 │   └── server.py        # MCP server（stdio）
-├── tests/               # pytest（全 mock）+ 可选 live test
-└── output/              # mode="save" 的 .npz 输出（git 忽略）
+├── scripts/
+│   ├── score_fasta.py   # 批量 FASTA 评分 + embedding 提取（每次运行独立 run 文件夹）
+│   └── analyze_run.py   # 下游分析：加载/关联 → 聚类/分类/回归 + PCA 图
+├── tests/               # pytest（全 mock，91 用例）+ 可选 live test
+└── output/              # mode="save" 的 .npz 输出 + run_*/ 运行结果（git 忽略）
 ```
