@@ -360,6 +360,31 @@ async def test_forward_logits_explicit_name(settings, fast_settings):
 
 
 @pytest.mark.asyncio
+async def test_forward_logits_concurrent_fallback(settings, fast_settings):
+    """Concurrent calls racing through the auto-probe must all succeed
+    (regression test for a clobbered-fallback race found via the live batch)."""
+    calls: list[list[str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read())
+        calls.append(payload["output_layers"])
+        if payload["output_layers"] == ["output_layer"]:
+            return httpx.Response(
+                422, json={"error": "StripedHyena has no attribute `output_layer`"}
+            )
+        return _unembed_npz_response()
+
+    client = make_client(settings, handler)
+    results = await asyncio.gather(*(client.forward_logits(sequence="ACGT") for _ in range(4)))
+    assert all(npz for npz, _ in results)
+    assert client.logits_layer == "unembed"
+    # every call must have finished with a successful response (some may have
+    # probed 'output_layer' first), and none may have re-probed after success.
+    assert all(c in (["output_layer"], ["unembed"]) for c in calls)
+    assert calls[-1] == ["unembed"]
+
+
+@pytest.mark.asyncio
 async def test_forward_logits_non_attribute_422_not_swallowed(settings, fast_settings):
     """A 422 that is NOT 'has no attribute' must propagate unchanged."""
 
