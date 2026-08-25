@@ -167,23 +167,26 @@ class Evo2Client:
           ``has no attribute`` (the hosted vortex-backed endpoint), retry once
           with ``unembed`` and cache the working name for this client.
         * explicit name: used as-is.
+
+        Concurrency-safe: each call remembers the layer name it *tried* in a
+        local variable, so concurrent calls that race through the probe cannot
+        clobber each other's fallback decision (they may duplicate one probe
+        request at most, which is harmless).
         """
         if self._logits_layer is None:
             raw = self.settings.logits_layer
-            if raw == "auto":
-                self._logits_layer = LOGITS_LAYER_FALLBACKS[0]
-            else:
-                self._logits_layer = raw
+            self._logits_layer = raw if raw != "auto" else LOGITS_LAYER_FALLBACKS[0]
 
+        tried = self._logits_layer
         try:
-            npz, meta = await self.forward(sequence=sequence, output_layers=[self._logits_layer])
+            npz, meta = await self.forward(sequence=sequence, output_layers=[tried])
         except Evo2APIError as e:
-            alt = _logits_alt_name(self._logits_layer)
+            alt = _logits_alt_name(tried)
             if alt is not None and e.status == 422 and "has no attribute" in (e.body or ""):
                 logger.info(
                     "Logits layer %r rejected by server ('has no attribute'); "
                     "switching to %r for this client.",
-                    self._logits_layer, alt,
+                    tried, alt,
                 )
                 self._logits_layer = alt
                 npz, meta = await self.forward(sequence=sequence, output_layers=[alt])
