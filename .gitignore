@@ -1,0 +1,45 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+
+# Virtual env / package manager caches
+.pixi/
+.uv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated outputs (large tensors, per-run artefacts)
+output/
+*.npz
+!tests/fixtures/*.npz
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+htmlcov/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
