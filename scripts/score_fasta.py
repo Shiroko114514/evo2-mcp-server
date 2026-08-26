@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import os
 import re
 import sys
@@ -132,7 +133,7 @@ def find_embedding_array(decoded: dict, layer: str) -> tuple[str, np.ndarray]:
 def _base_entry(source: str, rec_id: str, header: str, seq: str, status: str = "ok") -> dict:
     entry = dict.fromkeys(FIELD_NAMES)
     entry.update({
-        "id": rec_id, "header": header,
+        "source": source, "id": rec_id, "header": header,
         "sequence_length": len(seq), "n_count": seq.count("N"), "status": status,
     })
     return entry
@@ -240,6 +241,10 @@ async def main() -> None:
                     help="pass N through (server must also allow it)")
     ap.add_argument("--skip-longer-than", type=int, default=None)
     ap.add_argument("--max-concurrency", type=int, default=2)
+    ap.add_argument("--batch-delay", type=float, default=0.0,
+                    help="pause (seconds) between batches — gentle pacing that "
+                         "reduces 429 / 422 'Too Busy' throttling on the "
+                         "hosted endpoint")
     ap.add_argument("--embedding-layer", default="norm",
                     help="layer to extract embeddings from (e.g. norm, "
                          "blocks.31, embedding_layer); 'none' disables")
@@ -250,6 +255,12 @@ async def main() -> None:
     ap.add_argument("--keep-raw-embeddings", action="store_true",
                     help="also write per-record raw (1, seq, 4096) npz files "
                          "(DEFAULT OFF — they are huge on disk)")
+    ap.add_argument("--progress", type=Path, default=None,
+                    help="progress file (default: <run_dir>/progress.jsonl); "
+                         "used for resume-after-interrupt")
+    ap.add_argument("--retry-failed", type=int, default=1,
+                    help="after the main pass, retry error records this many "
+                         "more times (default 1)")
     args = ap.parse_args()
 
     ids = {i.strip() for i in args.ids.split(",")} if args.ids else None
@@ -271,55 +282,145 @@ async def main() -> None:
     print(f"selected {len(records)} records; concurrency={args.max_concurrency} "
           f"base_url={settings.base_url}", flush=True)
 
-    # --- Resolve the per-run output layout (new timestamped folder per run) ---
+    # --- Resolve the per-run output layout ----------------------------------
     out_root = settings.output_dir.resolve()
-    run_dir = out_root / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resume: if a progress file was given and exists, continue the SAME run
+    # folder instead of creating a new timestamped one.
+    resume_progress = None
+    if args.progress is not None and args.progress.is_file():
+        resume_progress = args.progress
+        run_dir = resume_progress.parent
+    else:
+        run_dir = out_root / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+        run_dir.mkdir(parents=True, exist_ok=True)
     print(f"run folder: {run_dir}", flush=True)
 
+    progress_path = args.progress or (run_dir / "progress.jsonl")
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path = args.out or (run_dir / "scores.csv")
     emb_raw_dir = args.embedding_raw_dir or (run_dir / "embeddings_raw" if args.keep_raw_embeddings else None)
     emb_out_path = args.embeddings_out or (run_dir / "embeddings.npz" if with_emb else None)
 
+    # --- Load already-done records (resume support) ---------------------------
+    done_keys: dict[str, dict] = {}   # (source,id) -> entry
+    done_pooled: dict[str, np.ndarray] = {}
+    if progress_path.is_file():
+        with progress_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                key = (rec.get("source", ""), rec.get("id", ""))
+                done_keys[key] = rec
+                if rec.get("status") == "ok" and rec.get("embedding_key"):
+                    done_pooled[rec["embedding_key"]] = np.array(rec.get("pooled_vec"), dtype=np.float32)
+        print(f"resume: {len(done_keys)} records already done, "
+              f"{len(done_pooled)} embeddings cached", flush=True)
+
     results: list[dict] = []
-    pooled: dict[str, np.ndarray] = {}
+    pooled: dict[str, np.ndarray] = dict(done_pooled)
 
-    async with Evo2Client(settings) as client:
-        logits_layer = None
-        if with_emb:
-            # Resolve the logits layer once (hosted API: output_layer -> unembed).
-            await client.forward_logits(sequence="ACGT")
-            logits_layer = client.logits_layer
-            print(f"logits layer: {logits_layer}; embedding layer: {emb_layer}", flush=True)
+    async def run_pass(pass_records, label: str) -> tuple[list[dict], list]:
+        """Run one pass over `pass_records`, appending results to the progress
+        file as each record completes. Returns (entries, pooled_vectors)."""
+        pass_entries: list[dict] = []
+        pass_pooled: list[tuple[str, np.ndarray]] = []
+        done = 0
 
-        sem = asyncio.Semaphore(max(1, args.max_concurrency))
+        async with Evo2Client(settings) as client:
+            logits_layer = None
+            if with_emb:
+                await client.forward_logits(sequence="ACGT")
+                logits_layer = client.logits_layer
+                if label == "main":
+                    print(f"logits layer: {logits_layer}; embedding layer: {emb_layer}", flush=True)
 
-        async def guarded(path, source, rec_id, header, seq):
-            async with sem:
-                if with_emb:
-                    entry, pooled_vec = await score_with_embedding(
+            sem = asyncio.Semaphore(max(1, args.max_concurrency))
+
+            async def guarded(path, source, rec_id, header, seq):
+                async with sem:
+                    if with_emb:
+                        entry, pooled_vec = await score_with_embedding(
+                            client, settings, source, rec_id, header, seq,
+                            args.allow_ambiguous, args.skip_longer_than,
+                            logits_layer, emb_layer, args.embedding_raw_dir,
+                        )
+                        return entry, pooled_vec
+                    return await score_basic(
                         client, settings, source, rec_id, header, seq,
                         args.allow_ambiguous, args.skip_longer_than,
-                        logits_layer, emb_layer, args.embedding_raw_dir,
-                    )
-                    return entry, pooled_vec
-                return await score_basic(
-                    client, settings, source, rec_id, header, seq,
-                    args.allow_ambiguous, args.skip_longer_than,
-                ), None
+                    ), None
 
-        done = 0
-        for i in range(0, len(records), args.max_concurrency):
-            batch = records[i:i + args.max_concurrency]
-            outcomes = await asyncio.gather(*(guarded(*b) for b in batch))
-            for entry, pooled_vec in outcomes:
-                results.append(entry)
-                if pooled_vec is not None and entry["status"] == "ok":
-                    pooled[pooled_vec[0]] = pooled_vec[1]
-            done += len(outcomes)
-            ok = sum(1 for e in outcomes if e[0]["status"] == "ok")
-            err = sum(1 for e in outcomes if e[0]["status"] == "error")
-            print(f"  [{done}/{len(records)}] last batch: ok={ok} err={err}", flush=True)
+            for i in range(0, len(pass_records), args.max_concurrency):
+                batch = pass_records[i:i + args.max_concurrency]
+                outcomes = await asyncio.gather(*(guarded(*b) for b in batch))
+                for entry, pooled_vec in outcomes:
+                    pass_entries.append(entry)
+                    if pooled_vec is not None and entry["status"] == "ok":
+                        _pk, _pv = pooled_vec  # score_with_embedding returns (key, vector)
+                        pass_pooled.append((_pk, _pv))
+                        # persist pooled vector inside the entry for resume
+                        entry["pooled_vec"] = _pv.tolist()
+                    with progress_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                done += len(outcomes)
+                ok = sum(1 for e in outcomes if e[0]["status"] == "ok")
+                err = sum(1 for e in outcomes if e[0]["status"] == "error")
+                print(f"  [{label} {done}/{len(pass_records)}] last batch: ok={ok} err={err}", flush=True)
+                if args.batch_delay > 0 and done < len(pass_records):
+                    await asyncio.sleep(args.batch_delay)
+
+        return pass_entries, pass_pooled
+
+    # --- Main pass: skip records that are already done -------------------------
+    todo = []
+    for rec in records:
+        key = (rec[1], rec[2])  # (source, id)
+        if key not in done_keys:
+            todo.append(rec)
+    print(f"main pass: {len(todo)} records to process "
+          f"({len(records) - len(todo)} already done)", flush=True)
+
+    if todo:
+        entries, pass_pooled = await run_pass(todo, "main")
+        results.extend(entries)
+        for k, v in pass_pooled:
+            pooled[k] = v
+    else:
+        print("nothing to do in main pass (all records already processed)", flush=True)
+
+    # --- Retry pass: retry error records ---------------------------------------
+    # Reload done keys to include results just written this run.
+    for rec in results:
+        done_keys[(rec.get("source", ""), rec.get("id", ""))] = rec
+    for attempt in range(args.retry_failed):
+        failed = [r for r in done_keys.values()
+                  if r.get("status") == "error" and not r.get("skipped", False)]
+        if not failed:
+            break
+        print(f"retry pass {attempt + 1}: {len(failed)} error records", flush=True)
+        retry_records = [r for r in records if (r[1], r[2]) in
+                         {(f.get("source", ""), f.get("id", "")) for f in failed}]
+        entries, pass_pooled = await run_pass(retry_records, "retry")
+        results.extend(entries)
+        for k, v in pass_pooled:
+            pooled[k] = v
+        # rebuild done_keys with the freshest statuses
+        for rec in entries:
+            done_keys[(rec.get("source", ""), rec.get("id", ""))] = rec
+
+    # --- Final results = all records with the latest status ---------------------
+    final_results = []
+    for rec in records:
+        key = (rec[1], rec[2])
+        entry = done_keys.get(key)
+        if entry is None:
+            entry = dict.fromkeys(FIELD_NAMES)
+            entry.update({"id": rec[2], "status": "error", "reason": "no result recorded"})
+        final_results.append(entry)
+    results = final_results
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
@@ -345,8 +446,10 @@ async def main() -> None:
     n_skip = sum(1 for e in results if e["status"] == "skipped")
     for e in results:
         if e["status"] == "error":
-            print(f"  ERROR {e['source']}::{e['id']}: {e['reason']}", file=sys.stderr)
+            print(f"  ERROR {e.get('source','')}::{e.get('id','')}: {e.get('reason')}", file=sys.stderr)
     print(f"\ndone: {n_ok} ok, {n_err} error, {n_skip} skipped -> {csv_path}")
+    print(f"progress file: {progress_path} (re-run with --progress {progress_path} "
+          f"to resume if interrupted)", flush=True)
 
 
 if __name__ == "__main__":
